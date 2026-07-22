@@ -59,7 +59,8 @@ paths:
     post:
       summary: Create or retry a ticket and dispatch durable research
       description: >-
-        requestId is the idempotency key (one ticket per Vapi call). A repeated
+        requestId is the idempotency key (one ticket per Vapi call). callId,
+        callerNumber, calledNumber, and requestId are trusted static Vapi fields. A repeated
         identical request returns the original ticket; reuse with different
         content returns idempotency_conflict. customerId is intentionally absent.
       requestBody:
@@ -74,7 +75,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Active call session is required, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '409': { description: Idempotency or session-state conflict, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '503': { description: Workflow dispatch failed and may be retried with the same request body, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchFailure' } } } }
+        '503': { description: Workflow dispatch failed and may be retried with the same request body, content: { application/json: { schema: { $ref: '#/components/schemas/WorkflowDispatchFailure' } } } }
   /api/tickets/{ticketId}:
     get:
       summary: Read ticket state (operator route)
@@ -98,7 +99,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Ticket not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '409': { description: Ticket is not waiting for human review, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '503': { description: Resolution dispatch failed and may be retried, content: { application/json: { schema: { $ref: '#/components/schemas/DispatchFailure' } } } }
+        '503': { description: Resolution dispatch failed and may be retried, content: { application/json: { schema: { $ref: '#/components/schemas/RetryableFailure' } } } }
   /api/tickets/{ticketId}/feedback:
     post:
       summary: Record customer feedback for deferred scoring
@@ -186,10 +187,12 @@ components:
     CreateTicketRequest:
       type: object
       additionalProperties: false
-      required: [callId, requestId, customerQuestion]
+      required: [callId, requestId, callerNumber, calledNumber, customerQuestion]
       properties:
         callId: { type: string, example: call_vapi_123 }
         requestId: { type: string, example: request_vapi_123 }
+        callerNumber: { type: string, example: '+15555550100' }
+        calledNumber: { type: string, example: '+15555550999' }
         customerQuestion: { type: string, example: My replicator stopped working after the latest update. }
         deviceModel: { type: string, example: XR-200 }
         firmwareVersion: { type: string, example: 9.4.0 }
@@ -197,17 +200,23 @@ components:
         errorCode: { type: string, example: THERM-94 }
     TicketResponse:
       type: object
-      required: [ticketId, requestId, status, created]
+      required: [ok, created, ticketId, ticketReference, ticketSaved, workflowStarted, status, duplicate, retryable]
       properties:
-        ticketId: { type: string }
-        requestId: { type: string }
-        status: { type: string, enum: [event_pending, researching, event_failed] }
+        ok: { type: boolean, const: true }
         created: { type: boolean }
+        ticketId: { type: string }
+        ticketReference: { type: string, pattern: '^REP-[0-9]{6}$' }
+        ticketSaved: { type: boolean, const: true }
+        workflowStarted: { type: boolean }
+        status: { type: string }
+        duplicate: { type: boolean }
+        retryable: { type: boolean, const: false }
     Ticket:
       type: object
-      required: [id, request_id, call_id, status, created_at]
+      required: [id, reference, request_id, call_id, status, created_at]
       properties:
         id: { type: string }
+        reference: { type: string, pattern: '^REP-[0-9]{6}$' }
         request_id: { type: string }
         call_id: { type: string }
         status: { type: string }
@@ -248,12 +257,23 @@ components:
       properties:
         error: { type: string, example: invalid_request }
         message: { type: string }
-    DispatchFailure:
+    WorkflowDispatchFailure:
       allOf:
         - $ref: '#/components/schemas/Error'
         - type: object
-          required: [ticketId, status, retryable]
+          required: [ok, ticketId, ticketReference, ticketSaved, workflowStarted, status, retryable]
           properties:
+            ok: { type: boolean, const: false }
             ticketId: { type: string }
-            status: { type: string, enum: [event_failed, needs_human_review] }
+            ticketReference: { type: string, pattern: '^REP-[0-9]{6}$' }
+            ticketSaved: { type: boolean, const: true }
+            workflowStarted: { type: boolean, const: false }
+            status: { type: string, const: event_failed }
+            retryable: { type: boolean, const: true }
+    RetryableFailure:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          required: [retryable]
+          properties:
             retryable: { type: boolean, const: true }

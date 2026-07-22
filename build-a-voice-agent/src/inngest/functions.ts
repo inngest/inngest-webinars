@@ -15,6 +15,7 @@ import { createScorer } from "inngest/experimental";
 import { mockResearchAnalysisMetadata } from "../demo/mock-ai-metadata.js";
 import OpenAI from "openai";
 import { z } from "zod";
+import { defaultCorrelationLogger, logCorrelation } from "../logging.js";
 
 type ModelMessage = { role: "system" | "user"; content: string };
 
@@ -78,7 +79,7 @@ export const researchSupportTicket = inngest.createFunction(
       step.run("knowledge-base-search", async () => {
         await demoDelay("knowledge-base");
         const customer = getCustomer(ticket.customer_id);
-        return customer ? getKnowledgeBaseArticles(customer.replicator_model, customer.firmware_version, ticket.issue) : [];
+        return customer ? getKnowledgeBaseArticles(customer.device_model, customer.firmware_version, ticket.issue) : [];
       }),
       step.run("faq-search", async () => {
         await demoDelay("faq");
@@ -153,6 +154,14 @@ export const researchSupportTicket = inngest.createFunction(
       if (status !== "needs_human_review") {
         return { ticketId: ticket.id, requestId: ticket.request_id, callId: ticket.call_id, status };
       }
+      logCorrelation(defaultCorrelationLogger, "ticket.state_transition", {
+        callId: ticket.call_id,
+        requestId: ticket.request_id,
+        ticketId: ticket.id,
+        fromStatus: "researching",
+        toStatus: "needs_human_review",
+        outcome: "success",
+      });
       await step.sendEvent("request-human-review", {
         name: "support/escalation.requested",
         data: { ticketId: ticket.id, requestId: ticket.request_id, callId: ticket.call_id },
@@ -170,6 +179,14 @@ export const researchSupportTicket = inngest.createFunction(
       if (!transitioned && current?.status !== "reply_queued" && current?.status !== "answered") {
         throw new Error(`Ticket ${ticket.id} could not transition to reply_queued`);
       }
+    });
+    logCorrelation(defaultCorrelationLogger, "ticket.state_transition", {
+      callId: ticket.call_id,
+      requestId: ticket.request_id,
+      ticketId: ticket.id,
+      fromStatus: "researching",
+      toStatus: "reply_queued",
+      outcome: "success",
     });
     await step.sendEvent("queue-email", {
       id: `support-reply-ready-${ticket.id}`,
@@ -200,6 +217,14 @@ export const waitForHumanResolution = inngest.createFunction(
       await step.run("mark-review-timeout", () =>
         transitionTicketStatus(event.data.ticketId, ["needs_human_review"], "review_timed_out"),
       );
+      logCorrelation(defaultCorrelationLogger, "ticket.state_transition", {
+        callId: event.data.callId,
+        requestId: event.data.requestId,
+        ticketId: event.data.ticketId,
+        fromStatus: "needs_human_review",
+        toStatus: "review_timed_out",
+        outcome: "success",
+      });
       return {
         ticketId: event.data.ticketId,
         requestId: event.data.requestId,
@@ -220,6 +245,14 @@ export const waitForHumanResolution = inngest.createFunction(
       if (!transitioned && current?.status !== "reply_queued" && current?.status !== "answered") {
         throw new Error(`Ticket ${event.data.ticketId} could not transition to reply_queued`);
       }
+    });
+    logCorrelation(defaultCorrelationLogger, "ticket.state_transition", {
+      callId: event.data.callId,
+      requestId: event.data.requestId,
+      ticketId: event.data.ticketId,
+      fromStatus: "human_resolved",
+      toStatus: "reply_queued",
+      outcome: "success",
     });
     await step.sendEvent("queue-human-approved-email", {
       id: `support-reply-ready-${event.data.ticketId}`,
@@ -252,6 +285,14 @@ export const sendSupportEmail = inngest.createFunction(
     // another provider later does not change the workflow around it.
     await step.run("record-email", () => {
       recordEmail(event.data.ticketId, event.data.recipient, event.data.body);
+    });
+    logCorrelation(defaultCorrelationLogger, "ticket.state_transition", {
+      callId: event.data.callId,
+      requestId: event.data.requestId,
+      ticketId: event.data.ticketId,
+      fromStatus: "reply_queued",
+      toStatus: "answered",
+      outcome: "success",
     });
     return {
       ticketId: event.data.ticketId,

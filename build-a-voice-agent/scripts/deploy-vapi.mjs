@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { validateVapiAssets } from "./validate-vapi-assets.mjs";
 
 const root = process.cwd();
 const envPath = path.join(root, ".env");
@@ -75,6 +76,7 @@ function updateEnv(values) {
 }
 
 async function main() {
+  validateVapiAssets();
   if (!process.env.VAPI_API_KEY) throw new Error("Missing VAPI_API_KEY in .env");
   if (!process.env.VAPI_API_CREDENTIAL_ID) {
     throw new Error("Missing VAPI_API_CREDENTIAL_ID; run npm run setup:auth first");

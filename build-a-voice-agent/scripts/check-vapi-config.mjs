@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { validateVapiAssets } from "./validate-vapi-assets.mjs";
 
 const root = process.cwd();
 
@@ -62,6 +63,7 @@ function expectedTool(relativePath, publicUrl) {
 }
 
 export async function assertVapiConfigMatches({ allowDrift = false } = {}) {
+  validateVapiAssets();
   for (const name of [
     "VAPI_API_KEY",
     "VAPI_ASSISTANT_ID",

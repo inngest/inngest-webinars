@@ -1,6 +1,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { validateVapiAssets } from "./validate-vapi-assets.mjs";
 
 const root = process.cwd();
 const envPath = path.join(root, ".env");
@@ -62,6 +63,7 @@ function updateEnv(values) {
 }
 
 async function main() {
+  validateVapiAssets();
   const manifest = readJson("manifest.json");
   const [personalities, existingScenarios, existingSimulations, existingSuites] =
     await Promise.all([

@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { assertVapiConfigMatches } from "./check-vapi-config.mjs";
+import { validateVapiAssets } from "./validate-vapi-assets.mjs";
 
 const args = process.argv.slice(2);
 const voice = args.includes("--voice");
@@ -50,6 +51,7 @@ function printSummary(run) {
 }
 
 async function main() {
+  validateVapiAssets();
   await assertVapiConfigMatches({ allowDrift });
   const transport = voice ? "vapi.websocket" : "vapi.webchat";
   console.log(`Starting ${iterations} iteration(s) in ${voice ? "voice" : "chat"} mode.`);

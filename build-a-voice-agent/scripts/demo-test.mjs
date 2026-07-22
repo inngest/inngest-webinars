@@ -23,6 +23,18 @@ async function json(response, step) {
   return body;
 }
 
+async function waitForTicketStatus(ticketId, expectedStatus, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "unknown";
+  while (Date.now() < deadline) {
+    const ticket = await json(await fetch(`${baseUrl}/api/tickets/${ticketId}`, { headers }), "ticket status");
+    lastStatus = ticket.status;
+    if (lastStatus === expectedStatus) return ticket;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`ticket ${ticketId} did not reach ${expectedStatus}; last status was ${lastStatus}`);
+}
+
 async function main() {
   const ticketRequestId = callContext.callId;
   await json(await fetch(`${baseUrl}/health`, { headers }), "health check");
@@ -68,6 +80,8 @@ async function main() {
   const ticketBody = {
     callId: callContext.callId,
     requestId: ticketRequestId,
+    callerNumber: callContext.callerNumber,
+    calledNumber: callContext.calledNumber,
     customerQuestion: "My replicator stopped working after the 9.4.0 update.",
     symptom: "The thermal-safety light flashes.",
     errorCode: "THERM-94",
@@ -75,7 +89,14 @@ async function main() {
   const creation = await json(await fetch(`${baseUrl}/api/tickets`, {
     method: "POST", headers, body: JSON.stringify(ticketBody),
   }), "ticket creation");
-  if (!creation.ticketId || creation.status !== "researching" || creation.created !== true) {
+  if (
+    !creation.ticketId ||
+    !/^REP-\d{6}$/.test(creation.ticketReference) ||
+    creation.status !== "researching" ||
+    creation.created !== true ||
+    creation.ticketSaved !== true ||
+    creation.workflowStarted !== true
+  ) {
     throw new Error(`ticket creation returned an unexpected contract: ${JSON.stringify(creation)}`);
   }
   console.log(`PASS ticket creation (${creation.ticketId})`);
@@ -84,7 +105,13 @@ async function main() {
     method: "POST", headers, body: JSON.stringify(ticketBody),
   });
   const duplicate = await json(duplicateResponse, "duplicate ticket creation");
-  if (duplicateResponse.status !== 200 || duplicate.ticketId !== creation.ticketId || duplicate.created !== false) {
+  if (
+    duplicateResponse.status !== 200 ||
+    duplicate.ticketId !== creation.ticketId ||
+    duplicate.ticketReference !== creation.ticketReference ||
+    duplicate.created !== false ||
+    duplicate.duplicate !== true
+  ) {
     throw new Error(`duplicate request was not safely reused: ${JSON.stringify(duplicate)}`);
   }
   console.log("PASS duplicate call request reused its ticket");
@@ -97,7 +124,38 @@ async function main() {
     throw new Error("conflicting request was not rejected");
   }
   console.log("PASS conflicting request rejected (409)");
-  console.log("\nDemo test passed. It validates bearer authentication, trusted call context, and idempotent dispatch.");
+
+  await waitForTicketStatus(creation.ticketId, "answered");
+  console.log("PASS known issue completed the research and delivery workflow");
+
+  const humanCallContext = {
+    ...callContext,
+    callId: `call_human_${crypto.randomUUID()}`,
+  };
+  await json(await fetch(`${baseUrl}/api/customers/lookup`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(humanCallContext),
+  }), "human-review caller lookup");
+  const humanTicket = await json(await fetch(`${baseUrl}/api/tickets`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...humanCallContext,
+      requestId: humanCallContext.callId,
+      customerQuestion: "Where is my replacement delivery?",
+    }),
+  }), "human-review ticket creation");
+  await waitForTicketStatus(humanTicket.ticketId, "needs_human_review");
+  console.log("PASS unrelated issue reached human review");
+  await json(await fetch(`${baseUrl}/api/tickets/${humanTicket.ticketId}/resolve`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ answer: "A technician will follow up with the delivery status." }),
+  }), "human resolution");
+  await waitForTicketStatus(humanTicket.ticketId, "answered");
+  console.log("PASS human resolution resumed and completed delivery");
+  console.log("\nDemo test passed. It validates authentication, trusted call context, idempotency, and both workflow branches.");
 }
 
 main().catch((error) => {

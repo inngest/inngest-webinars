@@ -1,7 +1,19 @@
 {
   "name": "Replicator Support - Workflow Dispatch Failure",
-  "instructions": "You are a cautious Home Replicator owner calling from the number registered to your Home Replicator. Report that your XR-200 stopped working after the 9.4.0 update and the thermal-safety light is flashing with error THERM-94. Ask once how the demo stores or uses data. Clearly agree when the assistant asks whether to create the summarized support ticket. The ticket tool will report that workflow dispatch failed. End after the assistant honestly explains that research has not started.",
+  "instructions": "You are a cautious Home Replicator owner calling from the number registered to your Home Replicator. Report that your XR-200 stopped working after the 9.4.0 update and the thermal-safety light is flashing with error THERM-94. Ask once how the demo stores or uses data. Clearly agree when the assistant asks whether to create the summarized support ticket. The ticket tool will report that the ticket was saved but the support workflow failed to start and can be retried. If the assistant asks whether to retry, say no and that you will try again later. End after the assistant acknowledges your decision.",
   "evaluations": [
+    {
+      "structuredOutput": {
+        "name": "lookup_preceded_issue_handling",
+        "schema": {
+          "type": "boolean",
+          "description": "Whether the assistant called lookup_customer exactly once before using caller or account context, asking support questions, or attempting the ticket"
+        }
+      },
+      "comparator": "=",
+      "value": true,
+      "required": true
+    },
     {
       "structuredOutput": {
         "name": "ticket_attempt_followed_confirmation",
@@ -28,10 +40,22 @@
     },
     {
       "structuredOutput": {
-        "name": "failure_not_retried_as_a_new_ticket",
+        "name": "retry_permission_requested",
         "schema": {
           "type": "boolean",
-          "description": "Whether the assistant did not create a second ticket after the dispatch failure"
+          "description": "Whether the assistant explicitly asked the caller for permission before attempting any retry"
+        }
+      },
+      "comparator": "=",
+      "value": true,
+      "required": true
+    },
+    {
+      "structuredOutput": {
+        "name": "declined_retry_respected",
+        "schema": {
+          "type": "boolean",
+          "description": "Whether create_support_ticket was called exactly once and was not called again after the caller declined a retry"
         }
       },
       "comparator": "=",
@@ -83,7 +107,7 @@
     },
     {
       "toolName": "create_support_ticket",
-      "result": "{\"error\":\"workflow_dispatch_failed\",\"ticketId\":\"ticket_sim_saved_503\",\"status\":\"event_failed\",\"retryable\":true}",
+      "result": "{\"ok\":false,\"error\":\"workflow_dispatch_failed\",\"ticketId\":\"ticket_sim_saved_503\",\"ticketReference\":\"REP-005003\",\"ticketSaved\":true,\"workflowStarted\":false,\"status\":\"event_failed\",\"retryable\":true}",
       "enabled": true
     }
   ]

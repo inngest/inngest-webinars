@@ -83,7 +83,7 @@
     },
     {
       "toolName": "create_support_ticket",
-      "result": "{\"ticketId\":\"ticket_sim_confirmed_001\",\"requestId\":\"call_sim_confirmed_001\",\"status\":\"researching\",\"created\":true}",
+      "result": "{\"ok\":true,\"created\":true,\"ticketId\":\"ticket_sim_confirmed_001\",\"ticketReference\":\"REP-004021\",\"ticketSaved\":true,\"workflowStarted\":true,\"status\":\"researching\",\"duplicate\":false,\"retryable\":false}",
       "enabled": true
     }
   ]

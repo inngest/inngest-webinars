@@ -18,9 +18,9 @@ db.exec(`
     email TEXT NOT NULL UNIQUE,
     phone TEXT NOT NULL UNIQUE,
     product TEXT NOT NULL,
-    replicator_model TEXT,
-    firmware_version TEXT,
-    warranty_status TEXT
+    device_model TEXT NOT NULL,
+    firmware_version TEXT NOT NULL,
+    warranty_status TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS faq_articles (
@@ -109,18 +109,105 @@ db.exec(`
   );
 `);
 
+type TableColumn = { name: string; notnull: number };
+
+function tableColumns(table: string) {
+  return db.prepare(`PRAGMA table_info(${table})`).all() as TableColumn[];
+}
+
+// Main temporarily renamed the canonical c9e10c1 `device_model` field to
+// `replicator_model`. Rebuild that table once so every checkout has one schema;
+// do not preserve two runtime names for the same value.
+function migrateCustomerSchema() {
+  const columns = tableColumns("customers");
+  const names = new Set(columns.map((column) => column.name));
+  const canonicalNames = [
+    "id",
+    "name",
+    "email",
+    "phone",
+    "product",
+    "device_model",
+    "firmware_version",
+    "warranty_status",
+  ];
+  const unexpected = columns
+    .map((column) => column.name)
+    .filter((name) => !canonicalNames.includes(name) && name !== "replicator_model");
+  if (unexpected.length > 0) {
+    throw new Error(`Unsupported customers schema columns: ${unexpected.join(", ")}`);
+  }
+
+  for (const required of ["id", "name", "email", "phone", "product", "firmware_version", "warranty_status"]) {
+    if (!names.has(required)) throw new Error(`Unsupported customers schema: missing ${required}`);
+  }
+  if (!names.has("device_model") && !names.has("replicator_model")) {
+    throw new Error("Unsupported customers schema: missing device_model");
+  }
+
+  const canonical = !names.has("replicator_model")
+    && ["device_model", "firmware_version", "warranty_status"].every(
+      (name) => columns.find((column) => column.name === name)?.notnull === 1,
+    );
+  if (canonical) return;
+
+  const deviceModelExpression = names.has("device_model") && names.has("replicator_model")
+    ? "COALESCE(device_model, replicator_model)"
+    : names.has("device_model")
+      ? "device_model"
+      : "replicator_model";
+  const invalid = db.prepare(
+    `SELECT COUNT(*) AS count FROM customers
+     WHERE ${deviceModelExpression} IS NULL
+        OR firmware_version IS NULL
+        OR warranty_status IS NULL`,
+  ).get() as { count: number };
+  if (invalid.count > 0) {
+    throw new Error("Cannot migrate customers: canonical device fields contain NULL values");
+  }
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE customers_canonical (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          email TEXT NOT NULL UNIQUE,
+          phone TEXT NOT NULL UNIQUE,
+          product TEXT NOT NULL,
+          device_model TEXT NOT NULL,
+          firmware_version TEXT NOT NULL,
+          warranty_status TEXT NOT NULL
+        );
+        INSERT INTO customers_canonical (
+          id, name, email, phone, product, device_model, firmware_version, warranty_status
+        )
+        SELECT
+          id, name, email, phone, product, ${deviceModelExpression}, firmware_version, warranty_status
+        FROM customers;
+        DROP TABLE customers;
+        ALTER TABLE customers_canonical RENAME TO customers;
+      `);
+      const violations = db.pragma("foreign_key_check") as Array<Record<string, unknown>>;
+      if (violations.length > 0) throw new Error("Customer migration would violate foreign keys");
+    }).immediate();
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+}
+
+migrateCustomerSchema();
+
 // SQLite does not add columns when CREATE TABLE runs against an existing local
-// database. These tiny migrations keep an attendee's database current.
+// database. These migrations keep additive application state current.
 function ensureColumn(table: string, column: string, definition: string) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  const columns = tableColumns(table);
   if (!columns.some((existing) => existing.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
-ensureColumn("customers", "replicator_model", "TEXT");
-ensureColumn("customers", "firmware_version", "TEXT");
-ensureColumn("customers", "warranty_status", "TEXT");
 ensureColumn("known_issues", "affected_model", "TEXT");
 ensureColumn("known_issues", "affected_firmware", "TEXT");
 ensureColumn("known_issues", "workaround", "TEXT");
@@ -132,13 +219,19 @@ ensureColumn("support_tickets", "error_code", "TEXT");
 ensureColumn("support_tickets", "follow_up_method", "TEXT");
 ensureColumn("support_tickets", "request_id", "TEXT");
 ensureColumn("support_tickets", "call_id", "TEXT");
+ensureColumn("support_tickets", "reference", "TEXT");
 ensureColumn("outbound_messages", "delivery_key", "TEXT");
 
 db.exec(`
+  UPDATE support_tickets
+  SET reference = 'REP-' || printf('%06d', rowid)
+  WHERE reference IS NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS support_tickets_request_id_unique
     ON support_tickets(request_id) WHERE request_id IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS support_tickets_call_id_unique
     ON support_tickets(call_id) WHERE call_id IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS support_tickets_reference_unique
+    ON support_tickets(reference) WHERE reference IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS outbound_messages_ticket_id_unique
     ON outbound_messages(ticket_id);
   CREATE UNIQUE INDEX IF NOT EXISTS outbound_messages_delivery_key_unique
@@ -156,7 +249,7 @@ export function seedDemoData() {
       db.prepare("UPDATE customers SET phone = 'legacy-cus-ada' WHERE id = 'cus_ada'").run();
       db.prepare(
         `INSERT INTO customers (
-           id, name, email, phone, product, replicator_model, firmware_version, warranty_status
+           id, name, email, phone, product, device_model, firmware_version, warranty_status
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         "cus_amanda",
@@ -164,7 +257,7 @@ export function seedDemoData() {
         "amanda.martin@example.com",
         legacyCustomer.phone,
         legacyCustomer.product,
-        legacyCustomer.replicator_model,
+        legacyCustomer.device_model,
         legacyCustomer.firmware_version,
         legacyCustomer.warranty_status,
       );
@@ -176,14 +269,14 @@ export function seedDemoData() {
 
   db.prepare(
     `INSERT INTO customers (
-       id, name, email, phone, product, replicator_model, firmware_version, warranty_status
+       id, name, email, phone, product, device_model, firmware_version, warranty_status
      ) VALUES (
        'cus_amanda', 'Amanda Martin', 'amanda.martin@example.com', '+15555550100',
        'Home Replicator', 'XR-200', '9.4.0', 'active'
      )
      ON CONFLICT(id) DO UPDATE SET
        product = excluded.product,
-       replicator_model = excluded.replicator_model,
+       device_model = excluded.device_model,
        firmware_version = excluded.firmware_version,
        warranty_status = excluded.warranty_status`,
   ).run();
@@ -239,6 +332,7 @@ export function seedDemoData() {
 
 export type Ticket = {
   id: string;
+  reference: string;
   request_id: string | null;
   call_id: string | null;
   customer_id: string;
@@ -262,7 +356,7 @@ export function getCustomerByContact(contact: string) {
         email: string;
         phone: string;
         product: string;
-        replicator_model: string;
+        device_model: string;
         firmware_version: string;
         warranty_status: string;
       }
@@ -277,7 +371,7 @@ export function getCustomer(id: string) {
         email: string;
         phone: string;
         product: string;
-        replicator_model: string;
+        device_model: string;
         firmware_version: string;
         warranty_status: string;
       }
@@ -316,7 +410,7 @@ export function createTicket(
   } = {},
 ) {
   const id = `ticket_${crypto.randomUUID()}`;
-  db.prepare(
+  const insertion = db.prepare(
     `INSERT INTO support_tickets (
        id, request_id, call_id, customer_id, issue, status, created_at, device_model, firmware_version,
        symptom, error_code, follow_up_method
@@ -334,6 +428,8 @@ export function createTicket(
     details.errorCode ?? null,
     details.followUpMethod ?? null,
   );
+  const reference = `REP-${String(insertion.lastInsertRowid).padStart(6, "0")}`;
+  db.prepare("UPDATE support_tickets SET reference = ? WHERE id = ?").run(reference, id);
   return getTicket(id)!;
 }
 
@@ -374,6 +470,10 @@ export function createCallSession(input: {
     new Date().toISOString(),
   );
   return getCallSession(input.callId)!;
+}
+
+export function deleteExpiredCallSessions(now = new Date().toISOString()) {
+  return db.prepare("DELETE FROM call_sessions WHERE expires_at <= ?").run(now).changes;
 }
 
 export function findFaqs(product: string, issue: string) {

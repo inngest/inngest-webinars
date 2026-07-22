@@ -2,7 +2,7 @@
 
 A deliberately small Vapi + Inngest support-agent demo for the webinar.
 
-Vapi verifies a caller and creates a support ticket. That ticket emits an
+Vapi matches trusted call context to a customer and creates a support ticket. That ticket emits an
 Inngest event. Inngest researches the local database, sends an answer when it
 finds one, or waits for a human resolution when it does not.
 
@@ -61,6 +61,26 @@ call-session, and human-review state are lost when the service restarts.
 
 ## Vapi tools
 
+### Agent configuration source of truth
+
+The repository is the source of truth for the complete Vapi assistant:
+
+- `vapi/assistant.config.json` defines the model, first message, voice, and transcriber.
+- `vapi/assistant-system-prompt.md` defines the assistant's conversation behavior.
+- `vapi/tools/*.json` defines the two API Request tools and trusted static parameters.
+- `vapi/simulations/*.json` defines the simulation suite, callers, mocks, and evaluations.
+- `scripts/deploy-vapi.mjs` publishes those files; `scripts/check-vapi-config.mjs` detects live drift.
+
+The normative trust boundaries, exact API payloads, subsystem ownership, and
+remaining backend work are in [`BACKEND-CONTRACT.md`](./BACKEND-CONTRACT.md).
+It supersedes the earlier uncommitted handoff notes.
+
+Secrets, Vapi resource IDs, credentials, and the environment-specific public URL belong in `.env`; behavior does not. Validate the repository configuration without contacting Vapi:
+
+```bash
+npm run validate:vapi
+```
+
 Keep Amanda's two API Request tools. `lookup_customer` receives trusted static
 Vapi call fields and creates or reuses the backend call session:
 
@@ -79,7 +99,7 @@ number. The two tools use:
 | Tool | Route | Model-facing input |
 | --- | --- | --- |
 | `lookup_customer` | `POST /api/customers/lookup` | `callId`, `callerNumber`, `calledNumber` (all static Vapi fields) |
-| `create_support_ticket` | `POST /api/tickets` | `customerQuestion`, optional device details; `callId` and `requestId` are static Vapi fields |
+| `create_support_ticket` | `POST /api/tickets` | `customerQuestion`, optional device details; `callId`, `requestId`, `callerNumber`, and `calledNumber` are static Vapi fields |
 
 Every `/api/*` tool and operator route requires
 `Authorization: Bearer $API_BEARER_TOKEN`. The temporary `/api/vapi/tools`
@@ -105,8 +125,8 @@ npm run check:vapi-config
 tools and the assistant, then writes their Vapi IDs and public URL to `.env`.
 The lookup tool sends `{{call.id}}`, `{{customer.number}}`, and
 `{{phoneNumber.number}}` as static parameters; they are not model-generated
-arguments. The ticket tool sends `{{call.id}}` as both its static `callId` and
-idempotent `requestId`.
+arguments. The ticket tool sends the same trusted call context plus
+`{{call.id}}` as its idempotent `requestId`.
 
 To provision the optional Vapi simulation suite after deploying the assistant:
 
@@ -141,6 +161,8 @@ curl -X POST http://localhost:3000/test \
   -d '{
     "callId": "call_amanda_demo",
     "requestId": "request_amanda_demo",
+    "callerNumber": "+15555550100",
+    "calledNumber": "+15555550999",
     "customerQuestion": "My replicator stopped working after the latest update.",
     "deviceModel": "XR-200",
     "firmwareVersion": "9.4.0",

@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   createCallSession,
   createTicket,
+  deleteExpiredCallSessions,
   getCallSession,
   getCustomer,
   getCustomerByContact,
@@ -18,6 +19,11 @@ import {
 } from "./db.js";
 import { inngest } from "./inngest/client.js";
 import { functions } from "./inngest/functions.js";
+import {
+  defaultCorrelationLogger,
+  logCorrelation,
+  type CorrelationLogger,
+} from "./logging.js";
 
 const demoMode = process.env.DEMO_MODE === "1";
 const apiToken = process.env.API_BEARER_TOKEN;
@@ -30,6 +36,7 @@ if (demoMode && process.env.NODE_ENV === "production") {
 }
 
 seedDemoData();
+deleteExpiredCallSessions();
 
 const callSessionSchema = z.object({
   callId: z.string().min(1).max(200),
@@ -40,6 +47,8 @@ const callSessionSchema = z.object({
 const ticketSchema = z.object({
   callId: z.string().min(1).max(200),
   requestId: z.string().min(1).max(200),
+  callerNumber: z.string().min(1).max(32),
+  calledNumber: z.string().min(1).max(32),
   customerQuestion: z.string().min(1).max(4_000),
   deviceModel: z.string().min(1).max(100).optional(),
   firmwareVersion: z.string().min(1).max(100).optional(),
@@ -65,8 +74,13 @@ class ApiError extends Error {
 
 function sendApiError(response: express.Response, error: unknown) {
   if (error instanceof ApiError) {
+    response.locals.correlation = {
+      ...response.locals.correlation,
+      errorCode: error.code,
+    };
     return response.status(error.status).json({ error: error.code, message: error.message, ...error.extra });
   }
+  response.locals.correlation = { ...response.locals.correlation, errorCode: "internal_error" };
   return response.status(500).json({ error: "internal_error", message: "Unexpected server error" });
 }
 
@@ -80,6 +94,7 @@ function parse<T extends z.ZodTypeAny>(schema: T, input: unknown): z.infer<T> {
 
 function requireApiToken(request: express.Request, response: express.Response) {
   if (!apiToken || request.get("authorization") !== `Bearer ${apiToken}`) {
+    response.locals.correlation = { ...response.locals.correlation, errorCode: "unauthorized" };
     response.status(401).json({ error: "unauthorized", message: "Valid bearer authentication is required" });
     return false;
   }
@@ -90,9 +105,17 @@ function publicCustomer(customer: NonNullable<ReturnType<typeof getCustomer>>) {
   return {
     name: customer.name,
     product: customer.product,
-    deviceModel: customer.replicator_model,
+    deviceModel: customer.device_model,
     firmwareVersion: customer.firmware_version,
   };
+}
+
+function normalizeE164(value: string) {
+  const normalized = value.trim().replace(/[\s().-]/g, "");
+  if (!/^\+[1-9]\d{7,14}$/.test(normalized)) {
+    throw new ApiError(400, "invalid_request", "Phone numbers must be valid E.164 values");
+  }
+  return normalized;
 }
 
 function requireActiveCallSession(callId: string) {
@@ -107,21 +130,32 @@ function requireActiveCallSession(callId: string) {
 }
 
 function registerTrustedCallSession(input: z.infer<typeof callSessionSchema>) {
-  const customer = getCustomerByContact(input.callerNumber);
+  const callerNumber = normalizeE164(input.callerNumber);
+  const calledNumber = normalizeE164(input.calledNumber);
+
+  const existing = getCallSession(input.callId);
+  if (existing) {
+    if (existing.caller_number !== callerNumber || existing.called_number !== calledNumber) {
+      throw new ApiError(409, "call_context_conflict", "callId was already registered with different trusted context");
+    }
+    const customer = getCustomer(existing.customer_id);
+    if (!customer) throw new ApiError(404, "customer_not_found", "The call session has no matching customer");
+    return { session: existing, customer, created: false };
+  }
+
+  const customer = getCustomerByContact(callerNumber);
   if (!customer) {
     throw new ApiError(404, "caller_not_found", "No customer matches the trusted caller number");
   }
 
-  const existing = getCallSession(input.callId);
-  if (existing) {
-    if (existing.caller_number !== input.callerNumber || existing.called_number !== input.calledNumber) {
-      throw new ApiError(409, "call_context_conflict", "callId was already registered with different trusted context");
-    }
-    return { session: existing, customer, created: false };
-  }
-
   const expiresAt = new Date(Date.now() + 30 * 60 * 1_000).toISOString();
-  const session = createCallSession({ ...input, customerId: customer.id, expiresAt });
+  const session = createCallSession({
+    callId: input.callId,
+    callerNumber,
+    calledNumber,
+    customerId: customer.id,
+    expiresAt,
+  });
   return { session, customer, created: true };
 }
 
@@ -138,30 +172,63 @@ function ticketMatches(ticket: Ticket, input: TicketInput, customerId: string) {
 
 type EventSender = (event: Parameters<typeof inngest.send>[0]) => ReturnType<typeof inngest.send>;
 
-async function dispatchTicket(ticket: Ticket, sendEvent: EventSender) {
-  if (ticket.status !== "event_pending" && ticket.status !== "event_failed") return ticket;
+async function dispatchTicket(ticket: Ticket, sendEvent: EventSender, logger: CorrelationLogger) {
+  if (ticket.status !== "event_pending" && ticket.status !== "event_failed") {
+    return { ticket, inngestEventId: undefined };
+  }
+  const previousStatus = ticket.status;
+  let inngestEventId: string | undefined;
   try {
-    await sendEvent({
+    const result = await sendEvent({
       id: `support-ticket-created-${ticket.request_id}`,
       name: "support/ticket.created",
       data: { ticketId: ticket.id, requestId: ticket.request_id, callId: ticket.call_id },
       meta: { sessions: { ticket_id: ticket.id, call_id: ticket.call_id ?? "unknown" } },
     });
+    inngestEventId = result.ids[0];
   } catch {
     transitionTicketStatus(ticket.id, ["event_pending", "event_failed"], "event_failed");
-    throw new ApiError(503, "workflow_dispatch_failed", "The research workflow could not be started", {
+    logCorrelation(logger, "ticket.state_transition", {
+      callId: ticket.call_id,
+      requestId: ticket.request_id,
       ticketId: ticket.id,
+      fromStatus: previousStatus,
+      toStatus: "event_failed",
+      outcome: "error",
+      errorCode: "workflow_dispatch_failed",
+    });
+    throw new ApiError(503, "workflow_dispatch_failed", "The research workflow could not be started", {
+      ok: false,
+      ticketId: ticket.id,
+      ticketReference: ticket.reference,
+      ticketSaved: true,
+      workflowStarted: false,
       status: "event_failed",
       retryable: true,
     });
   }
 
   transitionTicketStatus(ticket.id, ["event_pending", "event_failed"], "researching");
-  return getTicket(ticket.id)!;
+  const dispatched = getTicket(ticket.id)!;
+  logCorrelation(logger, "ticket.state_transition", {
+    callId: dispatched.call_id,
+    requestId: dispatched.request_id,
+    ticketId: dispatched.id,
+    fromStatus: previousStatus,
+    toStatus: "researching",
+    outcome: "success",
+    inngestEventId,
+  });
+  return { ticket: dispatched, inngestEventId };
 }
 
-async function createAndDispatchTicket(input: TicketInput, sendEvent: EventSender) {
-  const { customer } = requireActiveCallSession(input.callId);
+async function createAndDispatchTicket(input: TicketInput, sendEvent: EventSender, logger: CorrelationLogger) {
+  const { session, customer } = requireActiveCallSession(input.callId);
+  const callerNumber = normalizeE164(input.callerNumber);
+  const calledNumber = normalizeE164(input.calledNumber);
+  if (session.caller_number !== callerNumber || session.called_number !== calledNumber) {
+    throw new ApiError(409, "call_context_mismatch", "Trusted call context does not match the active call session");
+  }
   let ticket = getTicketByRequestId(input.requestId) ?? getTicketByCallId(input.callId);
   let created = false;
 
@@ -186,6 +253,14 @@ async function createAndDispatchTicket(input: TicketInput, sendEvent: EventSende
         },
       );
       created = true;
+      logCorrelation(logger, "ticket.state_transition", {
+        callId: ticket.call_id,
+        requestId: ticket.request_id,
+        ticketId: ticket.id,
+        fromStatus: null,
+        toStatus: "event_pending",
+        outcome: "success",
+      });
     } catch {
       ticket = getTicketByRequestId(input.requestId);
       if (!ticket || !ticketMatches(ticket, input, customer.id)) {
@@ -194,13 +269,47 @@ async function createAndDispatchTicket(input: TicketInput, sendEvent: EventSende
     }
   }
 
-  const dispatched = await dispatchTicket(ticket, sendEvent);
-  return { ticket: dispatched, created };
+  const dispatched = await dispatchTicket(ticket, sendEvent, logger);
+  return { ...dispatched, created };
 }
 
-export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSender }: { sendEvent?: EventSender } = {}) {
+function ticketSuccessResponse(ticket: Ticket, created: boolean) {
+  return {
+    ok: true,
+    created,
+    ticketId: ticket.id,
+    ticketReference: ticket.reference,
+    ticketSaved: true,
+    workflowStarted: !["event_pending", "event_failed"].includes(ticket.status),
+    status: ticket.status,
+    duplicate: !created,
+    retryable: false,
+  };
+}
+
+export function createApp({
+  sendEvent = inngest.send.bind(inngest) as EventSender,
+  logger = defaultCorrelationLogger,
+}: {
+  sendEvent?: EventSender;
+  logger?: CorrelationLogger;
+} = {}) {
   const app = express();
   app.use(express.json({ limit: "128kb" }));
+  app.use((request, response, next) => {
+    const startedAt = performance.now();
+    response.on("finish", () => {
+      logCorrelation(logger, "api.request", {
+        method: request.method,
+        route: request.route?.path ?? request.path,
+        ...response.locals.correlation,
+        outcome: response.statusCode < 400 ? "success" : "error",
+        httpStatus: response.statusCode,
+        durationMs: Number((performance.now() - startedAt).toFixed(1)),
+      });
+    });
+    next();
+  });
 
   app.get("/health", (_request, response) => response.json({ ok: true }));
 
@@ -210,6 +319,7 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
     if (!requireApiToken(request, response)) return;
     try {
       const input = parse(callSessionSchema, request.body);
+      response.locals.correlation = { toolName: "lookup_customer", callId: input.callId };
       const { session, customer, created } = registerTrustedCallSession(input);
       return response.status(created ? 201 : 200).json({ callId: session.call_id, expiresAt: session.expires_at, customer: publicCustomer(customer) });
     } catch (error) {
@@ -221,6 +331,8 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
     if (!requireApiToken(request, response)) return;
     try {
       const callIdOnly = z.object({ callId: z.string().min(1).max(200) }).strict().safeParse(request.body);
+      const callId = callIdOnly.success ? callIdOnly.data.callId : request.body?.callId;
+      response.locals.correlation = { toolName: "lookup_customer", callId };
       const customer = callIdOnly.success
         ? requireActiveCallSession(callIdOnly.data.callId).customer
         : registerTrustedCallSession(parse(callSessionSchema, request.body)).customer;
@@ -233,8 +345,19 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
   app.post("/api/tickets", async (request, response) => {
     if (!requireApiToken(request, response)) return;
     try {
-      const { ticket, created } = await createAndDispatchTicket(parse(ticketSchema, request.body), sendEvent);
-      return response.status(created ? 201 : 200).json({ ticketId: ticket.id, requestId: ticket.request_id, status: ticket.status, created });
+      const input = parse(ticketSchema, request.body);
+      response.locals.correlation = {
+        toolName: "create_support_ticket",
+        callId: input.callId,
+        requestId: input.requestId,
+      };
+      const { ticket, created, inngestEventId } = await createAndDispatchTicket(input, sendEvent, logger);
+      response.locals.correlation = {
+        ...response.locals.correlation,
+        ticketId: ticket.id,
+        inngestEventId,
+      };
+      return response.status(created ? 201 : 200).json(ticketSuccessResponse(ticket, created));
     } catch (error) {
       return sendApiError(response, error);
     }
@@ -244,8 +367,11 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
   app.post("/test", async (request, response) => {
     if (!demoMode) return response.status(404).json({ error: "not_found" });
     try {
-      const { ticket, created } = await createAndDispatchTicket(parse(ticketSchema, request.body), sendEvent);
-      return response.status(created ? 201 : 200).json({ ticketId: ticket.id, requestId: ticket.request_id, status: ticket.status, created });
+      const input = parse(ticketSchema, request.body);
+      response.locals.correlation = { callId: input.callId, requestId: input.requestId };
+      const { ticket, created, inngestEventId } = await createAndDispatchTicket(input, sendEvent, logger);
+      response.locals.correlation = { ...response.locals.correlation, ticketId: ticket.id, inngestEventId };
+      return response.status(created ? 201 : 200).json(ticketSuccessResponse(ticket, created));
     } catch (error) {
       return sendApiError(response, error);
     }
@@ -257,6 +383,7 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
     if (!requireApiToken(request, response)) return;
     const calls = request.body?.message?.toolCallList;
     const trustedCallId = request.body?.message?.call?.id;
+    response.locals.correlation = { callId: trustedCallId };
     if (!Array.isArray(calls) || typeof trustedCallId !== "string") {
       return response.status(400).json({ error: "invalid_vapi_payload", message: "A Vapi call ID and tool calls are required" });
     }
@@ -266,18 +393,35 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
       const args = call.arguments ?? call.function?.parameters ?? {};
       try {
         if (call.name === "lookup_customer") {
+          response.locals.correlation = { toolName: call.name, callId: trustedCallId };
           const { customer } = requireActiveCallSession(trustedCallId);
           results.push({ toolCallId: call.id, result: publicCustomer(customer) });
         } else if (call.name === "create_support_ticket") {
-          const input = parse(ticketSchema, { ...args, callId: trustedCallId });
-          const { ticket } = await createAndDispatchTicket(input, sendEvent);
-          results.push({ toolCallId: call.id, result: { created: true, ticketId: ticket.id, status: ticket.status } });
+          response.locals.correlation = { toolName: call.name, callId: trustedCallId, requestId: trustedCallId };
+          const { session } = requireActiveCallSession(trustedCallId);
+          const input = parse(ticketSchema, {
+            ...args,
+            requestId: trustedCallId,
+            callId: trustedCallId,
+            callerNumber: session.caller_number,
+            calledNumber: session.called_number,
+          });
+          const { ticket, created, inngestEventId } = await createAndDispatchTicket(input, sendEvent, logger);
+          response.locals.correlation = {
+            ...response.locals.correlation,
+            ticketId: ticket.id,
+            inngestEventId,
+          };
+          results.push({ toolCallId: call.id, result: ticketSuccessResponse(ticket, created) });
         } else {
           results.push({ toolCallId: call.id, result: { error: "unknown_tool" } });
         }
       } catch (error) {
         const apiError = error instanceof ApiError ? error : new ApiError(500, "internal_error", "Unexpected server error");
-        results.push({ toolCallId: call.id, result: { created: false, error: apiError.code, retryable: apiError.status === 503 } });
+        results.push({
+          toolCallId: call.id,
+          result: { created: false, error: apiError.code, retryable: apiError.status === 503, ...apiError.extra },
+        });
       }
     }
     return response.json({ results });
@@ -300,12 +444,18 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
         throw new ApiError(409, "invalid_ticket_state", "Human resolution is only allowed while a ticket needs review");
       }
       try {
-        await sendEvent({
+        const result = await sendEvent({
           id: `support-human-resolution-${ticket.id}`,
           name: "support/human-resolution.received",
           data: { ticketId: ticket.id, requestId: ticket.request_id, callId: ticket.call_id, answer },
           meta: { sessions: { ticket_id: ticket.id, call_id: ticket.call_id ?? "unknown" } },
         });
+        response.locals.correlation = {
+          callId: ticket.call_id,
+          requestId: ticket.request_id,
+          ticketId: ticket.id,
+          inngestEventId: result.ids[0],
+        };
       } catch {
         throw new ApiError(503, "workflow_dispatch_failed", "The resolution event could not be sent", {
           ticketId: ticket.id,
@@ -314,6 +464,12 @@ export function createApp({ sendEvent = inngest.send.bind(inngest) as EventSende
         });
       }
       transitionTicketStatus(ticket.id, ["needs_human_review"], "human_resolved");
+      logCorrelation(logger, "ticket.state_transition", {
+        ...response.locals.correlation,
+        fromStatus: "needs_human_review",
+        toStatus: "human_resolved",
+        outcome: "success",
+      });
       return response.json({ ok: true, ticketId: ticket.id, status: "human_resolved" });
     } catch (error) {
       return sendApiError(response, error);
